@@ -1,0 +1,9 @@
+# Local secrets and runtime artifacts
+config.yaml
+state/
+*.db
+venv/
+__pycache__/
+.pytest_cache/
+logs/
+*.log

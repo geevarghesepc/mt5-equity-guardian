@@ -1,0 +1,4 @@
+MetaTrader5==5.0.5735
+PyYAML==6.0.3
+requests==2.34.2
+pytest==9.1.1

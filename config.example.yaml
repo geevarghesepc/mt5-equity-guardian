@@ -1,0 +1,48 @@
+# MT5 Guardian Configuration
+# Copy this file to config.yaml and adjust values for your account.
+# Secrets can also be set via environment variables:
+#   MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+mode: "observe" # "observe" (log only) or "live" (execute trades)
+
+account:
+  login: 0 # Replace with your MT5 account number (leave 0 to use the currently active terminal account)
+  password: "" # Account password
+  server: "" # Broker server name (e.g. "MetaQuotes-Demo")
+
+thresholds:
+  base_risk_pct: 10.0 # 10% risk if 1 position (prop-firm style: consider 2-5%)
+  averaging_risk_pct: 15.0 # 15% risk if > 1 position
+  daily_drawdown_pct: 20.0 # 20% max daily drawdown (prop-firm style: consider 5%)
+  trailing_tighten_trigger_pct: 5.0 # If profit reaches 5%
+  trailing_tighten_risk_pct: 5.0 # Tighten trailing risk to 5%
+
+anti_averaging:
+  max_positions_per_symbol: 2
+  max_volume_per_symbol: 5.0 # Max total lots
+  prevent_loser_add: true # Close newest add only when older legs and the add are both in loss
+
+filters:
+  symbols: [] # Empty = all symbols; e.g. ["EURUSD", "GBPUSD"]
+  magic_numbers: [] # Empty = all magic numbers; e.g. [12345]
+
+failsafe:
+  broker_sl_points: 500 # Hard SL distance in points (500 points = 50 pips on 5-digit FX)
+
+execution:
+  close_deviation: 50 # Max slippage in points when closing positions
+  close_retries: 3 # Requote retries per close attempt
+  server_time_symbol: "EURUSD" # Symbol used to read broker server time for day rollover
+
+loop:
+  interval_ms: 300 # Execution loop sleep time in milliseconds (200-500 recommended for scalping)
+
+cooldown:
+  after_stop_sec: 60 # Pause guardian actions after trailing stop or breaker (0 = disabled)
+
+server:
+  day_reset_hour: 0 # Hour (broker server time) when the daily breaker resets
+
+telegram:
+  token: "" # Leave empty to disable
+  chat_id: ""
