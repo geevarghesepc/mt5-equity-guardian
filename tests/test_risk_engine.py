@@ -40,3 +40,13 @@ def test_daily_drawdown_breached():
     assert not daily_drawdown_breached(1000, 801, config)
     assert daily_drawdown_breached(1000, 800, config)
     assert daily_drawdown_breached(1000, 750, config)
+
+def test_calculate_profit_pct_zero_balance():
+    from risk_engine import calculate_profit_pct
+    assert calculate_profit_pct(0, 1000) == 0.0
+
+def test_trailing_threshold_zero_positions():
+    assert trailing_threshold(1000, 1000, 0, {}) == 0.0
+
+def test_daily_drawdown_breached_zero_balance():
+    assert not daily_drawdown_breached(0, -100, {})
