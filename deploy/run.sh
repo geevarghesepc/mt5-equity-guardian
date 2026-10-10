@@ -59,6 +59,12 @@ if [[ -f "$CONSOLE_LOG" ]]; then
   start_console_lines=$(wc -l < "$CONSOLE_LOG")
 fi
 
+echo "Health check"
+if ! su -s /bin/bash "$WINE_USER" -c "cd $(printf '%q' "$APP") && WINEPREFIX=$WINEPREFIX wine $PY_EXE health.py"; then
+  echo "Health check failed. The guardian was not started." >&2
+  exit 1
+fi
+
 su -s /bin/bash "$WINE_USER" -c \
   "cd $(printf '%q' "$APP") && tmux new-session -d -s $(printf '%q' "$SESSION") $(printf '%q' "WINEPREFIX=$WINEPREFIX wine $PY_EXE src/guardian_bot.py >>$CONSOLE_LOG 2>&1")"
 

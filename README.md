@@ -74,6 +74,7 @@ The `deploy/` directory contains scripts adapted for running the guardian inside
 ```bash
 # Inside the container (on drive_c):
 cd /config/.wine/drive_c
+sudo apt update && sudo apt install git -y
 git clone https://github.com/geevarghesepc/mt5-equity-guardian.git guardian
 cd guardian
 bash deploy/install.sh
@@ -88,6 +89,7 @@ bash deploy/run.sh
 su -s /bin/bash abc -c "tmux attach -t guardian"
 ```
 
+See [plans/deployment_runbook.md](plans/deployment_runbook.md) for full container procedures, recovery from Wine version mismatch (`version mismatch 855/930`), and session management.
 See `deploy/install.sh --help` for host-side Docker deployment.
 
 ## Run

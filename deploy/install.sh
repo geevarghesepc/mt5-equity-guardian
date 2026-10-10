@@ -1,77 +1,90 @@
 #!/usr/bin/env bash
 # Install the MT5 Guardian inside a Docker container running MetaTrader under Wine.
+# Repairs the WineHQ apt key, upgrades Wine to the stable build that provides
+# ucrtbase.crealf, installs tmux, stops any running wineserver to prevent version
+# mismatches, and installs Windows Python 3.14 when missing.
 #
-# Inside the container (drive_c):
+# Inside the container, on Wine drive C:
+#   cd /config/.wine/drive_c
+#   git clone https://github.com/geevarghesepc/mt5-equity-guardian.git guardian
+#   cd guardian
+#   bash deploy/install.sh
+#
+# Later, from that same folder:
+#   git pull
 #   bash deploy/install.sh
 #
 # From the host:
 #   CONTAINER=your-container bash deploy/install.sh
-#
-# After a git pull:
-#   bash deploy/install.sh
-#
-# This script:
-#   - Ensures Wine is 10.1+ (numpy on Python 3.14 needs crealf).
-#   - Installs tmux for background sessions.
-#   - Installs Windows Python 3.14 inside the Wine prefix if missing.
-#   - Installs requirements.txt.
-#   - Copies the project tree into drive_c if not already there.
-#   - Does not start the guardian.
-#   - Does not print the account password.
 
 set -euo pipefail
-
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-SRC=$(cd "$SCRIPT_DIR/.." && pwd)
 
 WINEPREFIX="${WINEPREFIX:-/config/.wine}"
 WINE_USER="${WINE_USER:-abc}"
 PY_EXE="${PY_EXE:-C:/Python314/python.exe}"
 PY_VERSION="${PY_VERSION:-3.14.0}"
-PY_INSTALLER_URL="https://www.python.org/ftp/python/${PY_VERSION}/python-${PY_VERSION}-amd64.exe"
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SRC=$(cd "$SCRIPT_DIR/.." && pwd)
 
 usage() {
-  echo "Usage:"
-  echo "  Inside the container:  bash $0"
-  echo "  From the host:         CONTAINER=<name> bash $0"
+  echo "Usage: CONTAINER=<name> bash deploy/install.sh" >&2
+  echo "   or, inside the container: bash deploy/install.sh --inside" >&2
   echo ""
   echo "Environment:"
   echo "  WINEPREFIX    Wine prefix (default: /config/.wine)"
   echo "  WINE_USER     Wine user (default: abc)"
   echo "  PY_EXE        Windows Python path (default: C:/Python314/python.exe)"
   echo "  CONTAINER     Docker container name (host-side deployment)"
-  exit 0
+  exit 2
 }
 
 run_as_abc() {
-  su -s /bin/bash "$WINE_USER" -c "export WINEPREFIX=$(printf '%q' "$WINEPREFIX"); wine $*"
+  if [[ "$(id -un)" == "$WINE_USER" ]]; then
+    WINEPREFIX="$WINEPREFIX" wine "$@"
+    return
+  fi
+  local quoted
+  quoted=$(printf '%q ' "$@")
+  su -s /bin/bash "$WINE_USER" -c "export WINEPREFIX=$(printf '%q' "$WINEPREFIX"); wine ${quoted}"
 }
 
 windows_python_installed() {
-  run_as_abc "$PY_EXE" --version >/dev/null 2>&1
+  [[ -f "${WINEPREFIX}/drive_c/Python314/python.exe" ]]
 }
 
 ensure_windows_python() {
   if windows_python_installed; then
-    echo "Python is already installed at $PY_EXE"
-    run_as_abc "$PY_EXE" --version
+    echo "Windows Python is already at ${PY_EXE}"
     return
   fi
-  echo "Installing Python $PY_VERSION"
-  local download="/tmp/python-installer.exe"
+  local installer="python-${PY_VERSION}-amd64.exe"
+  local url="https://www.python.org/ftp/python/${PY_VERSION}/${installer}"
+  # A leftover installer in /tmp is often owned by abc and not writable, and /tmp
+  # may be noexec. Put this copy on drive C, where the Wine user can read it natively.
+  local download="${WINEPREFIX}/drive_c/${installer}"
+  rm -f "/tmp/${installer}" "$download" || true
+  echo "Downloading ${url}"
   if command -v wget >/dev/null 2>&1; then
-    wget -q -O "$download" "$PY_INSTALLER_URL"
+    wget -O "$download" "$url"
   elif command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$download" "$PY_INSTALLER_URL"
+    curl -fsSL -o "$download" "$url"
   else
     echo "wget or curl is required to download Python." >&2
     exit 1
   fi
-  chown "$WINE_USER:$WINE_USER" "$download"
-  local win_download
-  win_download=$(winepath -w "$download" 2>/dev/null || echo "Z:${download}")
-  run_as_abc "$win_download" /quiet InstallAllUsers=1 TargetDir=C:\\Python314 PrependPath=1
-  sleep 2
+  chown "${WINE_USER}:${WINE_USER}" "$download"
+  chmod 644 "$download"
+  echo "Installing Python ${PY_VERSION} into C:\\Python314"
+  echo "If a Wine Mono window is open, click Cancel. Python does not need it."
+  # mscoree is the Mono prompt. Leaving it enabled blocks this quiet install on the desktop.
+  local quiet_install
+  quiet_install=$(printf '%q ' "C:/${installer}" /quiet InstallAllUsers=1 PrependPath=1 'TargetDir=C:\Python314')
+  if [[ "$(id -un)" == "$WINE_USER" ]]; then
+    WINEPREFIX="$WINEPREFIX" WINEDLLOVERRIDES="mscoree=d" wine "C:/${installer}" /quiet InstallAllUsers=1 PrependPath=1 'TargetDir=C:\Python314'
+  else
+    su -s /bin/bash "$WINE_USER" -c "export WINEPREFIX=$(printf '%q' "$WINEPREFIX"); export WINEDLLOVERRIDES=mscoree=d; wine ${quiet_install}"
+  fi
   if ! windows_python_installed; then
     echo "Python installer finished but ${PY_EXE} is missing." >&2
     exit 1
@@ -95,6 +108,9 @@ note_login_file() {
   if [[ -f "$dest/config.yaml" ]]; then
     chmod 600 "$dest/config.yaml"
     echo "config.yaml is in the container. The password was not printed."
+  elif [[ -f "$dest/config.local.yaml" ]]; then
+    chmod 600 "$dest/config.local.yaml"
+    echo "config.local.yaml is in the container. The password was not printed."
   else
     echo "No config.yaml. Put the login in that file, or export MT5_LOGIN, MT5_PASSWORD, and MT5_SERVER."
   fi
@@ -126,6 +142,7 @@ copy_tree() {
     note_login_file "$dest"
     return
   fi
+  # Exit 1 from the reader means a file changed during the read. Exit 2 is a real failure.
   set +e
   set +o pipefail
   tar -C "$SRC" \
@@ -156,6 +173,21 @@ wine_supports_crealf() {
   current=$(wine_release)
   [[ -n "$current" ]] || return 1
   printf '%s\n%s\n' "10.1" "$current" | sort -V -C
+}
+
+check_wine_working() {
+  su -s /bin/bash "$WINE_USER" -c "export WINEPREFIX=$(printf '%q' "$WINEPREFIX"); wine cmd.exe /c exit 0" >/dev/null 2>&1
+}
+
+stop_and_upgrade_wineserver() {
+  echo "Stopping the Wine server that was running before the upgrade (prevents version mismatch)"
+  su -s /bin/bash "$WINE_USER" -c "export WINEPREFIX=$(printf '%q' "$WINEPREFIX"); wineserver -k" 2>/dev/null || true
+  pkill -u "$WINE_USER" -f wineserver 2>/dev/null || true
+  sleep 1
+  # Wine 11's advapi32 forwards SystemFunction036 to cryptbase. A prefix built
+  # on Wine 10 still has the old forward and the Python installer aborts.
+  echo "Updating the Wine prefix to this Wine build (wineboot -u)"
+  su -s /bin/bash "$WINE_USER" -c "export WINEPREFIX=$(printf '%q' "$WINEPREFIX"); export WINEBOOTSTRAPMODE=1; export WINEDLLOVERRIDES=mscoree=d; wineboot -u"
 }
 
 detect_distro() {
@@ -192,7 +224,20 @@ fix_winehq_apt() {
   fi
   chmod 644 /etc/apt/keyrings/winehq-archive.gpg
 
-  cat > "/etc/apt/sources.list.d/winehq-${codename}.sources" <<EOF
+  local list found=0
+  shopt -s nullglob
+  for list in /etc/apt/sources.list.d/*[Ww]ine* /etc/apt/sources.list; do
+    [[ -f "$list" ]] || continue
+    if grep -q "dl.winehq.org" "$list"; then
+      found=1
+      sed -i 's|^Signed-By:.*|Signed-By: /etc/apt/keyrings/winehq-archive.gpg|' "$list"
+      sed -i 's|signed-by=[^] ]*|signed-by=/etc/apt/keyrings/winehq-archive.gpg|' "$list"
+    fi
+  done
+  shopt -u nullglob
+
+  if [[ "$found" -eq 0 ]]; then
+    cat > "/etc/apt/sources.list.d/winehq-${codename}.sources" <<EOF
 Types: deb
 URIs: ${wine_uri}
 Suites: ${codename}
@@ -200,43 +245,47 @@ Components: main
 Architectures: amd64 i386
 Signed-By: /etc/apt/keyrings/winehq-archive.gpg
 EOF
+  fi
 
   dpkg --add-architecture i386
   apt-get update
 }
 
 ensure_wine() {
-  if command -v wine >/dev/null 2>&1; then
-    if wine_supports_crealf; then
-      echo "Wine is already installed and meets version requirement (>= 10.1): $(wine --version)"
-      return 0
-    fi
-    echo "Wine is installed ($(wine --version)) but < 10.1. Upgrading to winehq-stable..."
-  else
-    echo "Wine is not installed. Installing winehq-stable..."
-  fi
-
+  local before after
+  before=$(wine_release || true)
   fix_winehq_apt
+  echo "Wine is $(wine --version 2>/dev/null || echo not installed)"
+  echo "Installing winehq-stable. Upgrading packages may overlap files, so dpkg will force-overwrite."
   set +e
   apt-get install -y -o Dpkg::Options::="--force-overwrite" winehq-stable
+  apt-get install -f -y -o Dpkg::Options::="--force-overwrite"
   local status=$?
   set -e
-  if [[ "$status" -ne 0 ]] || ! command -v wine >/dev/null 2>&1; then
-    echo "Failed to install Wine." >&2
+  if [[ "$status" -ne 0 ]] || ! wine_supports_crealf; then
+    echo "Wine is $(wine --version 2>/dev/null || echo missing). MetaTrader5 on Python 3.14 needs Wine 10.1 or newer." >&2
     exit 1
   fi
-  if ! wine_supports_crealf; then
-    echo "Wine installed ($(wine --version)) does not satisfy >= 10.1 requirement." >&2
-    exit 1
+  after=$(wine_release || true)
+  echo "Wine is now $(wine --version)"
+
+  # If Wine version did not change AND Wine is currently functional (no version mismatch with a running wineserver),
+  # then we can keep the running server/terminal intact.
+  if [[ -n "$before" && "$before" == "$after" ]] && check_wine_working; then
+    echo "Wine did not change and is responsive. The running terminal stays open."
+    return
   fi
-  echo "Wine installed: $(wine --version)"
+
+  # Either Wine was upgraded, or a running wineserver daemon has a protocol version mismatch (e.g. 855 vs 930).
+  # We must kill the old wineserver and update the prefix.
+  stop_and_upgrade_wineserver
 }
 
 ensure_tmux() {
   if command -v tmux >/dev/null 2>&1; then
     return
   fi
-  echo "Installing tmux"
+  echo "Installing tmux so the guardian can run in the background"
   if ! apt-get install -y tmux; then
     echo "tmux was not installed. The guardian stops when this terminal closes."
   fi
@@ -272,8 +321,13 @@ install_inside() {
   echo "Checking $PY_EXE"
   run_as_abc "$PY_EXE" --version
 
-  echo "Installing requirements.txt"
-  run_as_abc "$PY_EXE" -m pip install -r "${app_win}/requirements.txt"
+  if [[ -f "${dest}/requirements-prod.txt" ]]; then
+    echo "Installing requirements-prod.txt"
+    run_as_abc "$PY_EXE" -m pip install -r "${app_win}/requirements-prod.txt"
+  elif [[ -f "${dest}/requirements.txt" ]]; then
+    echo "Installing requirements.txt"
+    run_as_abc "$PY_EXE" -m pip install -r "${app_win}/requirements.txt"
+  fi
 
   echo "Checking imports"
   if ! run_as_abc "$PY_EXE" -c "import MetaTrader5, yaml, requests; print('imports ok')"; then
@@ -289,8 +343,10 @@ install_inside() {
   echo "Confirm the account is logged in. This script does not start the guardian."
   echo "Health check, no orders:"
   echo "  su -s /bin/bash $WINE_USER -c \"cd '$unix_app' && WINEPREFIX=$WINEPREFIX wine $PY_EXE health.py\""
-  echo "Start the guardian in tmux:"
+  echo "Start the guardian in tmux only when you want it running:"
   echo "  bash '$unix_app/deploy/run.sh'"
+  echo "Attach to session:"
+  echo "  su -s /bin/bash $WINE_USER -c \"tmux attach -t guardian\""
 }
 
 deploy_from_host() {
