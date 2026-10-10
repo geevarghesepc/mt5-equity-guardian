@@ -2,11 +2,14 @@
 
 Replaces the old combined-risk / global-loser behaviour with:
   1. Baseline awareness — positions already open when the guardian starts
-     are subject to the global cap but not to the pyramiding profit test.
+     are subject to the global cap. Baseline tickets are only exempt from
+     comparison against each other at startup; they are evaluated if a new
+     same-symbol ticket is later opened.
   2. Same-symbol admission — when a new managed ticket appears on a symbol
      that already has a managed ticket, the older one is closed if its
-     floating profit is <= 0.  Kept if profit > 0.  The decision is made
-     once, at the moment the new ticket is first detected.
+     floating profit is <= 0.  Kept if profit > 0.  An accepted ticket is
+     not closed merely because its profit turns negative while holding,
+     but a previously accepted ticket is re-evaluated on each later add.
   3. Global cap of two managed positions — after same-symbol handling,
      close the oldest by ``(time, ticket)`` until at most two remain.
   4. Failed closes are retained for retry on the next iteration.
@@ -26,7 +29,8 @@ class PositionPolicy:
     ----------
     baseline_tickets : set[int]
         Tickets that were open when the guardian first observed positions.
-        These are exempt from the same-symbol profit test.
+        Exempt from comparison against each other at startup, but evaluated
+        if a new same-symbol ticket is later opened.
     known_tickets : set[int]
         All ticket IDs the policy has ever seen.
     decided_tickets : dict[int, str]
@@ -51,8 +55,10 @@ class PositionPolicy:
     def set_baseline(self, positions: list[dict]):
         """Record the positions present at guardian startup.
 
-        Called exactly once.  Positions here are subject to the global cap
-        but *not* to the same-symbol profit test when a new ticket arrives.
+        Called exactly once.  Positions here are subject to the global cap.
+        Baseline tickets are only exempt from comparison against each other
+        at startup; they are evaluated if a new same-symbol ticket is later
+        opened.
         """
         if self._baseline_set:
             return

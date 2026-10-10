@@ -11,8 +11,8 @@ An automated guardian script for MetaTrader 5, designed to enforce a strict two-
 - **Same-Symbol Admission**: When a new ticket is detected on a symbol that already has a managed ticket:
   - If the older ticket's floating profit is **≤ 0** → close the older ticket immediately.
   - If the older ticket's floating profit is **> 0** (pyramiding a winner) → keep it.
-  - The decision is made **once**, at the moment the new ticket is first detected. An accepted ticket is never later closed merely because its profit turns negative.
-- **Startup Baseline**: Positions already open when the guardian starts are subject to the global cap but exempt from the same-symbol profit test.
+  - The admission decision is evaluated when a new ticket is detected. An accepted ticket is not closed merely because its profit turns negative while holding; however, a previously accepted ticket is re-evaluated on each later add on that symbol.
+- **Startup Baseline**: Positions already open when the guardian starts are subject to the global cap. Baseline tickets are only exempt from comparison against each other at startup; they are evaluated if a new same-symbol ticket is later opened.
 - **Scaled Trailing Equity Guard**: The trailing stop threshold is `peak_equity − balance × 5% × min(position_count, 2)`. With two tickets the combined allowance is 10%.
 - **2→1 Peak Reset**: When position count drops from 2 to 1 (including after a policy close), peak equity is reset to current equity before the new 5% trailing threshold takes effect.
 - **SL Preservation**: Tighter manual/existing SLs are never widened. Missing SLs are set; looser SLs are tightened. Tickets where the broker minimum stop distance exceeds the 5% budget or contract specs are invalid are reported as unprotected and closed. Transient broker SL placement failures wait `close_retries` consecutive loops before emergency closing naked positions, with failed broker close requests throttled via `emergency_close_retry_interval` (5s default).

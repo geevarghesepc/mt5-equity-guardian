@@ -19,11 +19,16 @@ anti_averaging:
   # Same-symbol rule: when a new ticket is detected on a symbol that already
   # has a managed ticket, the older ticket is closed if its floating profit
   # is <= 0.  If profit > 0 (pyramiding winner), it is kept.
-  # The decision is made once, at the moment the new ticket is first detected.
+  # The admission decision is made at the moment a new ticket is detected.
+  # An accepted ticket is not closed merely because its profit turns negative
+  # while holding, but a previously accepted ticket is re-evaluated on each
+  # later add on that symbol.
   # After same-symbol handling, the global cap of 2 is enforced by closing the
   # oldest remaining ticket ordered by (open_time, ticket).
   # Positions already open when the guardian starts are treated as baseline:
-  # they are subject to the global cap but not to the same-symbol profit test.
+  # they are subject to the global cap. Baseline tickets are only exempt from
+  # comparison against each other at startup; they are evaluated if a new
+  # same-symbol ticket is later opened.
 
 filters:
   symbols: [] # Empty = all symbols; e.g. ["EURUSD", "GBPUSD"]

@@ -217,7 +217,7 @@ def test_close_success_removes_pending():
 # ---------------------------------------------------------------------------
 
 def test_baseline_tickets_exempt_from_same_symbol_test():
-    """Tickets present at first observation are not tested for profit against each other."""
+    """Tickets present at first observation are exempt from comparison against each other at startup."""
     policy = PositionPolicy()
     config = {"anti_averaging": {"max_open_positions": 2}}
     # First observation: two tickets already open on EURUSD, ticket 1 losing.
@@ -228,8 +228,27 @@ def test_baseline_tickets_exempt_from_same_symbol_test():
     result = policy.evaluate(positions, config)
     assert 1 in policy.baseline_tickets
     assert 2 in policy.baseline_tickets
-    # Both are baseline tickets; neither was added afterward, so neither is closed.
+    # Both are baseline tickets; neither was added afterward, so neither is closed at startup.
     assert result == []
+
+
+def test_baseline_ticket_evaluated_when_new_same_symbol_ticket_opened():
+    """Baseline tickets are evaluated if a new same-symbol ticket is later opened."""
+    policy = PositionPolicy()
+    config = {"anti_averaging": {"max_open_positions": 2}}
+    # Startup baseline: ticket 1 open on EURUSD with negative profit.
+    positions = [_pos(1, symbol="EURUSD", profit=-10.0, time=1)]
+    result = policy.evaluate(positions, config)
+    assert result == [], "At startup, baseline ticket is not closed"
+
+    # Later, ticket 2 is opened on same symbol EURUSD.
+    positions = [
+        _pos(1, symbol="EURUSD", profit=-10.0, time=1),
+        _pos(2, symbol="EURUSD", profit=1.0, time=2),
+    ]
+    result = policy.evaluate(positions, config)
+    tickets = {p["ticket"] for p in result}
+    assert 1 in tickets, "Baseline ticket 1 is evaluated and closed as losing prior ticket"
 
 
 def test_baseline_tickets_still_subject_to_global_cap():
@@ -248,11 +267,11 @@ def test_baseline_tickets_still_subject_to_global_cap():
 
 
 # ---------------------------------------------------------------------------
-# Decision finality
+# Decision finality & re-evaluation
 # ---------------------------------------------------------------------------
 
 def test_accepted_ticket_not_closed_when_profit_turns_negative():
-    """An accepted (keep) ticket is never later closed by same-symbol logic."""
+    """An accepted (keep) ticket is not closed merely because its profit turns negative while holding (no new add)."""
     policy = PositionPolicy()
     config = {"anti_averaging": {"max_open_positions": 2}}
 
@@ -260,21 +279,21 @@ def test_accepted_ticket_not_closed_when_profit_turns_negative():
     positions = [_pos(1, symbol="EURUSD", profit=10.0, time=1)]
     policy.evaluate(positions, config)
 
-    # Ticket 2 arrives; ticket 1 is baseline (exempt).
+    # Ticket 2 arrives; ticket 1 has profit > 0 so it is evaluated and accepted/kept.
     positions = [
         _pos(1, symbol="EURUSD", profit=10.0, time=1),
         _pos(2, symbol="EURUSD", profit=0.5, time=2),
     ]
     policy.evaluate(positions, config)
 
-    # Ticket 1's profit turns negative.
+    # Ticket 1's profit turns negative while holding (no new add).
     positions = [
         _pos(1, symbol="EURUSD", profit=-5.0, time=1),
         _pos(2, symbol="EURUSD", profit=0.5, time=2),
     ]
     result = policy.evaluate(positions, config)
     tickets = {p["ticket"] for p in result}
-    assert 1 not in tickets, "Already-decided ticket should not be re-closed"
+    assert 1 not in tickets, "Already-decided ticket should not be closed without a new add"
 
 
 # ---------------------------------------------------------------------------
