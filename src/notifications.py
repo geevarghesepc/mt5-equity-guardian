@@ -1,17 +1,20 @@
+import html
 import logging
 import queue
 import threading
+import time
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-
 class Notifier:
-    def __init__(self, config):
-        self._queue = queue.Queue()
+    def __init__(self, config, max_queue_size=100, dedup_window_sec=15.0):
+        self._queue = queue.Queue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="telegram-notifier")
+        self._recent_messages: dict[str, float] = {}
+        self._dedup_window_sec = dedup_window_sec
         self.apply_config(config)
         self._worker.start()
 
@@ -22,14 +25,34 @@ class Notifier:
         self.enabled = bool(self.token and self.chat_id)
 
     def send(self, message):
-        """Enqueue a Telegram message; delivery happens off the hot loop path."""
-        if not self.enabled:
+        """Enqueue a Telegram message with rate-limiting and bounded queue."""
+        if not self.enabled or not message:
             return
-        self._queue.put(message)
+
+        now = time.time()
+        last_sent = self._recent_messages.get(message, 0.0)
+        if now - last_sent < self._dedup_window_sec:
+            logger.debug("Suppressing duplicate notification within dedup window: %s", message)
+            return
+
+        # Prune old entries
+        if len(self._recent_messages) > 200:
+            self._recent_messages = {
+                m: t for m, t in self._recent_messages.items() if now - t < self._dedup_window_sec
+            }
+        self._recent_messages[message] = now
+
+        try:
+            self._queue.put_nowait(message)
+        except queue.Full:
+            logger.warning("Notification queue full (size %d); dropping message: %s", self._queue.maxsize, message)
 
     def shutdown(self):
         self._stop_event.set()
-        self._queue.put(None)
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
         self._worker.join(timeout=2)
 
     def _worker_loop(self):
@@ -46,9 +69,10 @@ class Notifier:
 
     def _send_sync(self, message):
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        escaped_message = html.escape(message, quote=False)
         payload = {
             "chat_id": self.chat_id,
-            "text": message,
+            "text": escaped_message,
             "parse_mode": "HTML",
         }
         try:

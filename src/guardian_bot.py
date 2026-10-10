@@ -9,19 +9,19 @@ from config_loader import load_config, replace_config
 from logging_setup import setup_logging
 from mt5_executor import MT5Executor
 from risk_engine import update_peak_equity, trailing_threshold, daily_drawdown_breached
-from anti_averaging import evaluate as evaluate_anti_avg
+from anti_averaging import PositionPolicy
 from state_store import StateStore
 from notifications import Notifier
 
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_INTERVAL_SEC = 300
+HEARTBEAT_INTERVAL_SEC = 60
 
 
 def get_server_day_key(account_login, reset_hour=0, reference_symbol="EURUSD"):
     tick = mt5.symbol_info_tick(reference_symbol)
     if tick:
-        server_time = datetime.utcfromtimestamp(tick.time)
+        server_time = datetime.fromtimestamp(tick.time, timezone.utc).replace(tzinfo=None)
     else:
         server_time = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -88,40 +88,133 @@ def ensure_mt5_connection(executor, notifier, mt5_online):
     return None, False
 
 
-def run_iteration(config, executor, store, notifier, mt5_online, cooldown_until):
-    """Run one guardian loop iteration. Returns (mt5_online, cooldown_until)."""
+def _close_policy_tickets(executor, store, notifier, policy, tickets_to_close):
+    """Close tickets decided by the position policy.  Report results back."""
+    closed_count = 0
+    for t in tickets_to_close:
+        ticket = int(t["ticket"])
+        symbol = t["symbol"]
+        profit = t.get("profit", 0)
+
+        # Determine reason for the close message.
+        decision = policy.decided_tickets.get(ticket)
+        if decision == "close":
+            reason_label = "Same-symbol loser"
+            reason_code = "SAME_SYMBOL_CLOSE"
+        elif ticket in policy.pending_closes:
+            reason_label = "Retry pending close"
+            reason_code = "RETRY_CLOSE"
+        else:
+            reason_label = "Global cap eviction (oldest)"
+            reason_code = "GLOBAL_CAP_EVICTION"
+
+        msg = (
+            f"⚠️ {reason_label}: Ticket {ticket} "
+            f"({symbol}, profit={profit})"
+        )
+
+        if executor.mode == "live":
+            now = time.time()
+            if not isinstance(getattr(executor, "_last_close_log", None), dict):
+                executor._last_close_log = {}
+            last_log = executor._last_close_log.get(ticket, 0.0)
+            should_log = (now - last_log >= 10.0) or (decision != "close" and ticket not in policy.pending_closes)
+
+            if should_log:
+                logger.warning(msg)
+                executor._last_close_log[ticket] = now
+
+            success = executor.close_ticket(t, reason=reason_label)
+            policy.report_close_result(ticket, t, success)
+            if success:
+                executor._last_close_log.pop(ticket, None)
+                store.log_action(reason_code, t)
+                notifier.send(msg)
+                closed_count += 1
+            else:
+                if should_log:
+                    logger.error("Failed to close ticket %d for %s.", ticket, reason_label)
+        else:
+            # Observe mode: simulate logging without permanently marking as closed
+            # on the broker. Keep pending so switching to live mode executes it.
+            if ticket not in policy.pending_closes:
+                logger.warning("[OBSERVE] %s", msg)
+                executor.close_ticket(t, reason=reason_label)
+                notifier.send(f"[OBSERVE] {msg}")
+                closed_count += 1
+            policy.report_close_result(ticket, t, success=False)
+
+    return closed_count
+
+
+def run_iteration(
+    config, executor, store, notifier, policy, mt5_online, cooldown_until,
+    prev_pos_count,
+):
+    """Run one guardian loop iteration.
+
+    Returns ``(mt5_online, cooldown_until, current_pos_count)``.
+    """
     if not reload_config(config):
-        return mt5_online, cooldown_until
+        return mt5_online, cooldown_until, prev_pos_count
 
     loop_interval, reset_hour, server_time_symbol, cooldown_sec, account_changed = apply_runtime_config(
         config, executor, notifier
     )
 
     if account_changed:
-        logger.info("Account credentials changed in config; reconnecting.")
+        logger.info("Account credentials changed in config; reconnecting and resetting policy.")
+        policy.reset()
+        prev_pos_count = 0
         if not executor.reconnect():
             notifier.send("🚨 MT5 Guardian failed to reconnect after account config change.")
             time.sleep(1)
-            return mt5_online, cooldown_until
+            return mt5_online, cooldown_until, prev_pos_count
 
     account, mt5_online = ensure_mt5_connection(executor, notifier, mt5_online)
     if not account:
         time.sleep(1)
-        return mt5_online, cooldown_until
+        return mt5_online, cooldown_until, prev_pos_count
 
     now = time.time()
     if cooldown_until and now < cooldown_until:
         time.sleep(loop_interval)
-        return mt5_online, cooldown_until
+        return mt5_online, cooldown_until, prev_pos_count
 
-    equity = float(account["equity"])
-    balance = float(account["balance"])
+    # Validate hedging account mode on first successful connection.
+    if not executor.validate_hedging(account):
+        if executor.mode == "live":
+            if getattr(executor, "_non_hedging_alerted", False) is not True:
+                logger.error("Live enforcement blocked: non-hedging account mode.")
+                notifier.send("🚨 Live enforcement BLOCKED: non-hedging account mode!")
+                executor._non_hedging_alerted = True
+            time.sleep(loop_interval)
+            return mt5_online, cooldown_until, prev_pos_count
+
+    equity = float(account.get("equity", 0.0))
+    balance = float(account.get("balance", 0.0))
+
+    if balance <= 0 or equity <= 0:
+        logger.warning("Account balance or equity is 0. MT5 might still be syncing. Skipping loop.")
+        time.sleep(1)
+        return mt5_online, cooldown_until, prev_pos_count
 
     positions = executor.get_positions()
     pos_count = len(positions)
 
-    for p in positions:
-        executor.ensure_stop_loss(p, equity, pos_count)
+    # In observe mode, track effective active positions (excluding already pending policy
+    # closes and already observed unprotected closes) so repeat iterations with static
+    # pending closes do not repeatedly trigger peak resets.
+    if executor.mode != "live":
+        already_simulated = set(policy.pending_closes.keys()) | getattr(executor, "_observed_unprotected", set())
+        if already_simulated:
+            active_managed_count = len([p for p in positions if int(p["ticket"]) not in already_simulated])
+            max_pos_count_in_cycle = max(prev_pos_count, active_managed_count)
+            pos_count = active_managed_count
+        else:
+            max_pos_count_in_cycle = max(prev_pos_count, pos_count)
+    else:
+        max_pos_count_in_cycle = max(prev_pos_count, pos_count)
 
     day_key = get_server_day_key(account["login"], reset_hour, server_time_symbol)
     state = store.get_state(day_key)
@@ -169,26 +262,78 @@ def run_iteration(config, executor, store, notifier, mt5_online, cooldown_until)
             logger.warning("Breaker tripped but positions still open. Closing all.")
             executor.close_all("Daily Circuit Breaker")
         time.sleep(loop_interval)
-        return mt5_online, cooldown_until
+        return mt5_online, cooldown_until, pos_count
 
-    tickets_to_flatten = evaluate_anti_avg(positions, config)
-    for t in tickets_to_flatten:
-        msg = f"⚠️ Anti-Averaging Flatten: Ticket {t['ticket']} ({t['symbol']})"
-        logger.warning(msg)
-        if executor.close_ticket(t):
-            store.log_action("ANTI_AVG_FLATTEN", t)
-            notifier.send(msg)
+    # ---- Position policy: same-symbol admission → global cap → retries ---
+    tickets_to_close = policy.evaluate(positions, config)
+    closed_count = 0
+    if tickets_to_close:
+        closed_count = _close_policy_tickets(
+            executor, store, notifier, policy, tickets_to_close
+        )
 
-    if tickets_to_flatten:
-        positions = executor.get_positions()
-        pos_count = len(positions)
-        refreshed_account = executor.get_account()
-        if refreshed_account:
-            equity = float(refreshed_account["equity"])
+    if closed_count > 0:
+        if executor.mode == "live":
+            positions = executor.get_positions()
+            pos_count = len(positions)
+            refreshed_account = executor.get_account()
+            if refreshed_account:
+                equity = float(refreshed_account.get("equity", equity))
+                balance = float(refreshed_account.get("balance", balance))
+        else:
+            pos_count = max(0, pos_count - closed_count)
 
-    threshold = trailing_threshold(peak_equity, start_balance, pos_count, config)
+    # ---- SL enforcement: single unified pass for stop-losses & unprotected closes ----
+    unprotected = executor.manage_stop_losses(positions, balance)
+    if unprotected:
+        for pos in unprotected:
+            ticket = int(pos["ticket"])
+            symbol = pos.get("symbol", "")
+            profit = pos.get("profit", 0.0)
+            vol = pos.get("volume", 0.0)
+            if executor.mode == "live":
+                store.log_action("UNPROTECTED_CLOSE", pos)
+                notifier.send(
+                    f"🛡️ Closed unprotected ticket {ticket} ({symbol}, {vol} lots, profit={profit})."
+                )
+            else:
+                store.log_action("UNPROTECTED_CLOSE", pos)
+                notifier.send(
+                    f"[OBSERVE] Would close unprotected ticket {ticket} ({symbol}, {vol} lots, profit={profit})."
+                )
+
+        if executor.mode == "live":
+            positions = executor.get_positions()
+            pos_count = len(positions)
+            refreshed_account = executor.get_account()
+            if refreshed_account:
+                equity = float(refreshed_account.get("equity", equity))
+                balance = float(refreshed_account.get("balance", balance))
+        else:
+            pos_count = max(0, pos_count - len(unprotected))
+
+    # ---- 2→1 peak reset: when count drops from >= 2 to 1 ------------------
+    # Covers: multi-iteration drop, same-loop 1→2→1 replacement, and manage_stop_losses
+    if max_pos_count_in_cycle >= 2 and pos_count == 1:
+        logger.info(
+            "Position count fell from %d to %d. "
+            "Resetting peak equity from %.2f to current equity %.2f.",
+            max_pos_count_in_cycle,
+            pos_count,
+            peak_equity,
+            equity,
+        )
+        peak_equity = equity
+        store.save_state(day_key, start_balance, peak_equity, breaker_tripped)
+        notifier.send(
+            f"📊 Peak equity reset to {equity:.2f} "
+            f"(positions {max_pos_count_in_cycle} → {pos_count})."
+        )
+
+    # ---- Trailing equity stop --------------------------------------------
+    threshold = trailing_threshold(peak_equity, balance, pos_count, config)
     if pos_count > 0 and equity <= threshold:
-        msg = f"💥 TRAILING STOP HIT! Equity {equity} <= {threshold} (Peak: {peak_equity})"
+        msg = f"💥 TRAILING STOP HIT! Equity {equity:.2f} <= {threshold:.2f} (Peak: {peak_equity:.2f})"
         logger.critical(msg)
         executor.close_all("Trailing Equity Stop")
         store.log_action(
@@ -201,7 +346,7 @@ def run_iteration(config, executor, store, notifier, mt5_online, cooldown_until)
         time.sleep(1)
 
     time.sleep(loop_interval)
-    return mt5_online, cooldown_until
+    return mt5_online, cooldown_until, pos_count
 
 
 def run():
@@ -216,6 +361,7 @@ def run():
     executor = MT5Executor(config)
     store = StateStore()
     notifier = Notifier(config)
+    policy = PositionPolicy()
 
     if not executor.connect():
         notifier.send("🚨 MT5 Guardian failed to connect!")
@@ -229,12 +375,14 @@ def run():
     cooldown_until = 0.0
     last_heartbeat = time.time()
     consecutive_errors = 0
+    prev_pos_count = 0
 
     try:
         while True:
             try:
-                mt5_online, cooldown_until = run_iteration(
-                    config, executor, store, notifier, mt5_online, cooldown_until
+                mt5_online, cooldown_until, prev_pos_count = run_iteration(
+                    config, executor, store, notifier, policy,
+                    mt5_online, cooldown_until, prev_pos_count,
                 )
                 consecutive_errors = 0
             except Exception as exc:
@@ -250,11 +398,12 @@ def run():
                 account = executor.get_account()
                 if account:
                     logger.info(
-                        "Heartbeat: account=%s equity=%s balance=%s mode=%s",
+                        "Heartbeat: account=%s equity=%s balance=%s mode=%s positions=%d",
                         account.get("login"),
                         account.get("equity"),
                         account.get("balance"),
                         executor.mode,
+                        prev_pos_count,
                     )
                 else:
                     logger.warning("Heartbeat: MT5 account unavailable.")
